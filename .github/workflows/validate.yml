@@ -1,0 +1,154 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  theme:
+    name: Validate theme
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Run validator
+        run: node scripts/validate-theme.mjs themes/claude.json
+
+  installers:
+    name: Test installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Test Unix installer
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/opencode-config"
+          mkdir -p "$XDG_CONFIG_HOME/opencode"
+          printf '\357\273\277{"animations": false, "note": "caf\303\251 \342\230\225", "session": {"sidebar": "hide"}}\n' > "$XDG_CONFIG_HOME/opencode/cli.json"
+          chmod 600 "$XDG_CONFIG_HOME/opencode/cli.json"
+          bash install.sh --mode light
+          test -f "$XDG_CONFIG_HOME/opencode/themes/claude.json"
+          python3 - "$XDG_CONFIG_HOME/opencode/cli.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8-sig") as handle:
+              data = json.load(handle)
+
+          assert data["theme"] == {"name": "claude", "mode": "light"}, data["theme"]
+          assert data["animations"] is False, data["animations"]
+          assert data["session"] == {"sidebar": "hide"}, data["session"]
+          assert data["note"] == "caf\u00e9 \u2615", data["note"]
+          PY
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            test "$(stat -c %a "$XDG_CONFIG_HOME/opencode/cli.json")" = "600"
+          fi
+          ls "$XDG_CONFIG_HOME/opencode"/cli.json.bak-* >/dev/null
+          if compgen -G "$XDG_CONFIG_HOME/opencode/.cli.json-*.tmp" >/dev/null; then
+            echo "Temporary file left behind" >&2
+            exit 1
+          fi
+
+      - name: Test --no-activate
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/opencode-noactivate"
+          bash install.sh --no-activate
+          test -f "$XDG_CONFIG_HOME/opencode/themes/claude.json"
+          test ! -f "$XDG_CONFIG_HOME/opencode/cli.json"
+
+      - name: Test symlinked cli.json
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/opencode-symlink"
+          mkdir -p "$XDG_CONFIG_HOME/opencode" "$RUNNER_TEMP/dotfiles"
+          printf '%s\n' '{"animations": true}' > "$RUNNER_TEMP/dotfiles/cli.json"
+          chmod 600 "$RUNNER_TEMP/dotfiles/cli.json"
+          ln -s "$RUNNER_TEMP/dotfiles/cli.json" "$XDG_CONFIG_HOME/opencode/cli.json"
+          bash install.sh
+          test -L "$XDG_CONFIG_HOME/opencode/cli.json"
+          test "$(stat -c %a "$RUNNER_TEMP/dotfiles/cli.json")" = "600"
+          python3 - "$RUNNER_TEMP/dotfiles/cli.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          assert data["theme"] == {"name": "claude", "mode": "dark"}, data["theme"]
+          assert data["animations"] is True, data["animations"]
+          PY
+
+      - name: Test Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:XDG_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "opencode-config"
+          $configDir = Join-Path $env:XDG_CONFIG_HOME "opencode"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+          $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+          [System.IO.File]::WriteAllText(
+            (Join-Path $configDir "cli.json"),
+            '{"animations": false, "session": {"sidebar": "hide"}}',
+            $utf8Bom
+          )
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ./install.ps1 -Mode light
+          $themePath = Join-Path $configDir "themes/claude.json"
+          if (-not (Test-Path $themePath)) { throw "Theme not installed" }
+          $cli = Get-Content (Join-Path $configDir "cli.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($cli.theme.name -ne "claude" -or $cli.theme.mode -ne "light") {
+            throw "Theme not activated"
+          }
+          if ($cli.animations -ne $false) { throw "animations not preserved" }
+          if ($cli.session.sidebar -ne "hide") { throw "session not preserved" }
+          if (-not (Get-ChildItem $configDir -Filter "cli.json.bak-*")) {
+            throw "Backup not created"
+          }
+
+      - name: Test Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $env:XDG_CONFIG_HOME = Join-Path $env:RUNNER_TEMP "opencode-config-ps5"
+          $configDir = Join-Path $env:XDG_CONFIG_HOME "opencode"
+          New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+          $note = "caf" + [char]0x00E9 + " " + [char]0x2615
+          $json = '{"animations": false, "note": "' + $note + '", "session": {"sidebar": "hide"}}'
+          $cliPath = Join-Path $configDir "cli.json"
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText($cliPath, $json, $utf8NoBom)
+          & ./install.ps1 -Mode Light
+          $themePath = Join-Path $configDir "themes/claude.json"
+          if (-not (Test-Path $themePath)) { throw "Theme not installed" }
+          $cli = Get-Content $cliPath -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ($cli.note -ne $note) { throw "UTF-8 corrupted" }
+          if ($cli.theme.name -ne "claude" -or $cli.theme.mode -ne "light") {
+            throw "Theme not activated or mode not normalized"
+          }
+          if ($cli.animations -ne $false) { throw "animations not preserved" }
+          if ($cli.session.sidebar -ne "hide") { throw "session not preserved" }
+          if (-not (Get-ChildItem $configDir -Filter "cli.json.bak-*")) {
+            throw "Backup not created"
+          }
+          if (Get-ChildItem $configDir -Filter ".cli.json.tmp-*") {
+            throw "Temporary file left behind"
+          }
